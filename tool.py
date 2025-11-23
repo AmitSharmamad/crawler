@@ -8,11 +8,43 @@ import httpx
 
 async def inspect_site(url: str) -> dict:
     """
-    Inspects the website to understand its structure and metadata.
+    Inspects a website to understand its structure, metadata, and organization.
+
+    This function performs a comprehensive analysis of a website by:
+    - Extracting metadata (title, description, keywords)
+    - Analyzing navigation structure (header, nav, footer links)
+    - Parsing sitemap to understand site structure
+
+    Args:
+        url (str): The website URL to inspect. Must include protocol (http/https).
+
     Returns:
-        - metadata: Title, description, keywords.
-        - navigation: Links found in header, nav, and footer.
-        - sitemap_summary: Summary of sitemap contents (if available).
+        dict: A dictionary containing:
+            - metadata (dict): Page metadata
+                - title (str): Page title
+                - description (str | None): Meta description
+                - keywords (str | None): Meta keywords
+            - navigation (dict): Navigation links by section
+                - header (list): Links in <header> tags
+                - nav (list): Links in <nav> tags
+                - footer (list): Links in <footer> tags
+                Each link is: {"text": str, "url": str}
+            - sitemap_summary (dict): Sitemap analysis
+                - total_urls (int): Total URLs in sitemap
+                - structure_hint (dict): URL path prefixes and counts
+            - error (str): Error message if inspection failed (optional)
+
+    Example:
+        >>> result = await inspect_site("https://example.com")
+        >>> print(result['metadata']['title'])
+        'Example Domain'
+        >>> print(result['sitemap_summary']['total_urls'])
+        150
+
+    Note:
+        - Uses stealth mode to avoid detection
+        - Respects robots.txt for sitemap discovery
+        - Timeout is 15 seconds for page load
     """
     result = {"metadata": {}, "navigation": {}, "sitemap_summary": {}}
 
@@ -79,8 +111,40 @@ async def discover_links(
     url: str, keywords: list[str], scope: str = "domain"
 ) -> list[dict]:
     """
-    Finds links matching specific keywords in URL or anchor text.
-    Returns a list of objects: {url, text, score, context}.
+    Discovers and ranks links on a webpage based on keyword relevance.
+
+    Searches through all links on a page and scores them based on keyword matches
+    in both the URL and anchor text. Results are ranked by relevance score.
+
+    Args:
+        url (str): The webpage URL to search for links.
+        keywords (list[str]): List of keywords to search for. Case-insensitive.
+        scope (str, optional): Link scope filter. Defaults to "domain".
+            - "domain": Allow links from any subdomain of the main domain
+            - "subdomain": Only exact subdomain matches
+
+    Returns:
+        list[dict]: Sorted list of matching links (highest score first):
+            - url (str): Full URL of the link
+            - text (str): Anchor text
+            - score (int): Relevance score (URL match=5, text match=10)
+            - matches (list[str]): List of match descriptions (e.g., ["url:api", "text:docs"])
+
+    Example:
+        >>> links = await discover_links(
+        ...     "https://python.org",
+        ...     keywords=["documentation", "tutorial", "download"]
+        ... )
+        >>> for link in links[:3]:
+        ...     print(f"{link['score']}: {link['text']} - {link['url']}")
+        15: Download Python - https://python.org/downloads
+        10: Documentation - https://python.org/docs
+
+    Note:
+        - Empty links are automatically filtered out
+        - Links are deduplicated by URL
+        - Scoring: URL keyword match = +5 points, text match = +10 points
+        - Uses stealth mode to avoid bot detection
     """
     discovered = []
     start_domain = urlparse(url).netloc
@@ -155,8 +219,50 @@ async def extract_links(
     max_pages: int = 50,
 ) -> list[str]:
     """
-    Extracts links based on topology and scope.
-    Topology: 'mesh' (BFS), 'linear' (next/prev), 'hub_and_spoke' (depth 1), 'sidebar'.
+    Crawls a website to discover internal links using various crawling strategies.
+
+    Performs breadth-first or specialized crawling based on topology parameter.
+    Respects robots.txt and applies scope restrictions.
+
+    Args:
+        url (str): Starting URL for the crawl.
+        topology (str, optional): Crawling strategy. Defaults to "mesh".
+            - "mesh": Breadth-first search, discovers all connected pages
+            - "linear": Follows next/previous links (pagination)
+            - "hub_and_spoke": Only crawls direct links from start page (depth 1)
+            - "sidebar": Focuses on sidebar and navigation links
+        scope (str, optional): URL scope restriction. Defaults to "subdomain".
+            - "subdomain": Only exact subdomain match (e.g., www.example.com)
+            - "domain": Allow all subdomains (e.g., *.example.com)
+            - "path": Stay within same path prefix (not yet implemented)
+        ignore_queries (bool, optional): Strip query parameters from URLs. Defaults to True.
+        max_pages (int, optional): Maximum pages to crawl. Defaults to 50.
+
+    Returns:
+        list[str]: List of discovered URLs (unique).
+
+    Example:
+        >>> # Crawl entire site
+        >>> urls = await extract_links(
+        ...     "https://example.com",
+        ...     topology="mesh",
+        ...     max_pages=100
+        ... )
+        >>> print(f"Found {len(urls)} pages")
+
+        >>> # Only get direct links
+        >>> urls = await extract_links(
+        ...     "https://example.com/docs",
+        ...     topology="hub_and_spoke"
+        ... )
+
+    Note:
+        - Depth limit: mesh=3, hub_and_spoke=1
+        - Automatically checks robots.txt compliance
+        - Removes fragment identifiers (#) from URLs
+        - Query parameters removed if ignore_queries=True
+        - Uses stealth mode to avoid detection
+        - Stops when max_pages reached or no more links
     """
     start_domain = urlparse(url).netloc
     found_urls = set()
@@ -250,10 +356,51 @@ async def extract_content(
     url: str, click_selectors: list[str] = None, screenshot: bool = False
 ) -> dict:
     """
-    Extracts content from a URL.
-    - Handles click_selectors to reveal content.
-    - Returns Markdown, Screenshot (optional), and Metadata.
-    - Checks Content-Type for PDF/JSON (basic implementation).
+    Extracts clean, readable content from a webpage in Markdown format.
+
+    Downloads and processes webpage content with automatic HTML cleaning,
+    markdown conversion, and support for dynamic content. Can handle
+    PDFs and JSON responses.
+
+    Args:
+        url (str): URL of the webpage to extract content from.
+        click_selectors (list[str], optional): CSS selectors to click before extraction.
+            Useful for revealing hidden content, accepting cookies, etc.
+            Example: ["#accept-cookies", ".show-more-button"]
+        screenshot (bool, optional): Capture page screenshot. Defaults to False.
+
+    Returns:
+        dict: Extracted content and metadata:
+            - markdown (str): Page content in Markdown format
+            - screenshot (str | None): Hex-encoded PNG screenshot if requested
+            - metadata (dict): Page metadata
+                - title (str): Page title
+                - url (str): Final URL after redirects
+                - type (str): Content type ("html", "pdf", "json")
+            - error (str): Error message if extraction failed (optional)
+
+    Example:
+        >>> # Basic extraction
+        >>> result = await extract_content("https://example.com")
+        >>> print(result['metadata']['title'])
+        >>> print(result['markdown'][:500])
+
+        >>> # Handle dynamic content
+        >>> result = await extract_content(
+        ...     "https://example.com/article",
+        ...     click_selectors=["#show-full-article"],
+        ...     screenshot=True
+        ... )
+
+    Note:
+        - Automatically detects and handles PDF/JSON content types
+        - Uses readability algorithm to extract main content
+        - Removes ads, navigation, and boilerplate
+        - Auto-scrolls page to trigger lazy-loaded content
+        - Waits for network idle before extraction
+        - Uses stealth mode to avoid bot detection
+        - Click selectors executed with 2s timeout each
+        - Timeout: 30 seconds for page load
     """
     result = {"markdown": None, "screenshot": None, "metadata": {}}
 
