@@ -7,9 +7,17 @@ requires-python = ">=3.13"
 dependencies = [
     "beautifulsoup4>=4.14.2",
     "fake-useragent>=2.2.0",
+    "httpx>=0.28.1",
     "markdownify>=1.2.2",
     "playwright>=1.56.0",
     "playwright-stealth>=2.0.0",
+    "pytest-asyncio>=0.25.2",
     "readability-lxml>=0.8.4.1",
     "requests>=2.32.5",
+]
+
+[tool.pytest.ini_options]
+filterwarnings = [
+    # Ignore playwright-stealth library warning (known issue with async context)
+    "ignore:coroutine 'Page.add_init_script' was never awaited:RuntimeWarning",
 ]

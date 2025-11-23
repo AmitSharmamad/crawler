@@ -1,238 +1,329 @@
-import requests
-from bs4 import BeautifulSoup
-from markdownify import markdownify as md
-from playwright.sync_api import sync_playwright
-from playwright_stealth import Stealth
-from fake_useragent import UserAgent
-from urllib.parse import urljoin, urlparse
-from urllib.robotparser import RobotFileParser
-import xml.etree.ElementTree as ET
+from playwright.async_api import async_playwright
+from urllib.parse import urlparse, urljoin
 from collections import deque
+import util
 import json
-import time
-from readability import Document
+import httpx
 
-def get_stealth_context(p):
-    """
-    Creates a browser context with stealth settings.
-    """
-    ua = UserAgent()
-    user_agent = ua.random
-    browser = p.chromium.launch(headless=True)
-    context = browser.new_context(user_agent=user_agent)
-    return browser, context
 
-def auto_scroll(page):
+async def inspect_site(url: str) -> dict:
     """
-    Scrolls to the bottom of the page to trigger lazy loading.
+    Inspects the website to understand its structure and metadata.
+    Returns:
+        - metadata: Title, description, keywords.
+        - navigation: Links found in header, nav, and footer.
+        - sitemap_summary: Summary of sitemap contents (if available).
     """
-    last_height = page.evaluate("document.body.scrollHeight")
-    while True:
-        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        time.sleep(1)  # Wait for content to load
-        new_height = page.evaluate("document.body.scrollHeight")
-        if new_height == last_height:
-            break
-        last_height = new_height
+    result = {"metadata": {}, "navigation": {}, "sitemap_summary": {}}
 
-def extract_content(url: str) -> str:
-    """
-    Extracts content from a given URL and converts it to Markdown.
-    Uses stealth, auto-scroll, and readability for better quality.
-    """
-    with sync_playwright() as p:
-        browser, context = get_stealth_context(p)
-        page = context.new_page()
-        stealth = Stealth()
-        stealth.apply_stealth_sync(page)
-        
+    async with async_playwright() as p:
+        browser, context = await util.get_stealth_context(p)
+        page = await context.new_page()
+        await util.apply_stealth(page)
+
         try:
-            page.goto(url, wait_until="networkidle")
-            auto_scroll(page)
-            
-            content = page.content()
-            doc = Document(content)
-            cleaned_html = doc.summary()
-            
-            # Convert to Markdown
-            markdown = md(cleaned_html)
-            return markdown
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+
+            # Metadata
+            result["metadata"]["title"] = await page.title()
+            try:
+                result["metadata"]["description"] = await page.locator(
+                    'meta[name="description"]'
+                ).get_attribute("content")
+            except Exception:
+                result["metadata"]["description"] = None
+            try:
+                result["metadata"]["keywords"] = await page.locator(
+                    'meta[name="keywords"]'
+                ).get_attribute("content")
+            except Exception:
+                result["metadata"]["keywords"] = None
+
+            # Navigation
+            for section in ["header", "nav", "footer"]:
+                links = []
+                try:
+                    elements = await page.locator(section).all()
+                    for el in elements:
+                        anchors = await el.locator("a").all()
+                        for a in anchors:
+                            href = await a.get_attribute("href")
+                            text = (await a.inner_text()).strip()
+                            if href and text:
+                                links.append({"text": text, "url": urljoin(url, href)})
+                except Exception:
+                    pass
+                result["navigation"][section] = links
+
         except Exception as e:
-            return f"Error extracting content: {e}"
+            result["error"] = str(e)
         finally:
-            browser.close()
+            await browser.close()
 
-def get_sitemap_urls(url: str, allowed_domain: str) -> list[str]:
+    # Sitemap Summary
+    domain = urlparse(url).netloc
+    sitemap_urls = await util.get_sitemap_urls(url, domain)
+    result["sitemap_summary"]["total_urls"] = len(sitemap_urls)
+    # Simple heuristic to guess structure from sitemap
+    paths = [urlparse(u).path for u in sitemap_urls]
+    common_prefixes = {}
+    for path in paths:
+        prefix = "/" + path.strip("/").split("/")[0]
+        common_prefixes[prefix] = common_prefixes.get(prefix, 0) + 1
+    result["sitemap_summary"]["structure_hint"] = common_prefixes
+
+    return result
+
+
+async def discover_links(
+    url: str, keywords: list[str], scope: str = "domain"
+) -> list[dict]:
     """
-    Extracts URLs from sitemaps, filtering by allowed domain.
+    Finds links matching specific keywords in URL or anchor text.
+    Returns a list of objects: {url, text, score, context}.
     """
-    urls = []
-    parsed_url = urlparse(url)
-    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-    
-    sitemap_urls = []
-    
-    # Check robots.txt
-    try:
-        robots_resp = requests.get(urljoin(base_url, "/robots.txt"), timeout=10)
-        if robots_resp.status_code == 200:
-            for line in robots_resp.text.splitlines():
-                if line.lower().startswith("sitemap:"):
-                    sitemap_urls.append(line.split(":", 1)[1].strip())
-    except Exception:
-        pass
+    discovered = []
+    start_domain = urlparse(url).netloc
 
-    if not sitemap_urls:
-        sitemap_url = urljoin(base_url, "/sitemap.xml")
-        sitemap_urls.append(sitemap_url)
+    async with async_playwright() as p:
+        browser, context = await util.get_stealth_context(p)
+        page = await context.new_page()
+        await util.apply_stealth(page)
 
-    for sm_url in sitemap_urls:
         try:
-            resp = requests.get(sm_url, timeout=10)
-            if resp.status_code == 200:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            anchors = await page.locator("a").all()
+
+            for a in anchors:
                 try:
-                    root = ET.fromstring(resp.content)
-                    namespaces = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-                    
-                    if root.tag.endswith('sitemapindex'):
-                         for sitemap in root.findall('ns:sitemap', namespaces):
-                            loc = sitemap.find('ns:loc', namespaces)
-                            if loc is not None:
-                                try:
-                                    sub_resp = requests.get(loc.text, timeout=10)
-                                    if sub_resp.status_code == 200:
-                                        sub_root = ET.fromstring(sub_resp.content)
-                                        for url_tag in sub_root.findall('ns:url', namespaces):
-                                            loc_tag = url_tag.find('ns:loc', namespaces)
-                                            if loc_tag is not None and urlparse(loc_tag.text).netloc == allowed_domain:
-                                                urls.append(loc_tag.text)
-                                except Exception:
-                                    pass
-                    else:
-                        for url_tag in root.findall('ns:url', namespaces):
-                            loc = url_tag.find('ns:loc', namespaces)
-                            if loc is not None and urlparse(loc.text).netloc == allowed_domain:
-                                urls.append(loc.text)
-                except ET.ParseError:
-                    pass
-        except Exception:
-            pass
-            
-    return urls
+                    href = await a.get_attribute("href")
+                    text = (await a.inner_text()).strip()
 
-def get_common_crawl_urls(url: str, allowed_domain: str) -> list[str]:
-    """
-    Queries Common Crawl for URLs, filtering by allowed domain.
-    """
-    urls = []
-    index_url = "http://index.commoncrawl.org/CC-MAIN-2024-33-index"
-    query_url = f"{index_url}?url={allowed_domain}/*&output=json"
-    
-    try:
-        resp = requests.get(query_url, timeout=10)
-        if resp.status_code == 200:
-            for line in resp.text.splitlines():
-                try:
-                    data = json.loads(line)
-                    if 'url' in data:
-                        if urlparse(data['url']).netloc == allowed_domain:
-                            urls.append(data['url'])
-                except json.JSONDecodeError:
-                    pass
-    except Exception:
-        pass
-        
-    return urls
+                    if not href:
+                        continue
 
-def is_allowed_by_robots(url: str, user_agent: str = "*") -> bool:
-    """
-    Checks if a URL is allowed by robots.txt.
-    """
-    parsed_url = urlparse(url)
-    base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-    robots_url = urljoin(base_url, "/robots.txt")
-    
-    rp = RobotFileParser()
-    rp.set_url(robots_url)
-    try:
-        rp.read()
-        return rp.can_fetch(user_agent, url)
-    except Exception:
-        return True # Fail open if robots.txt is unreachable or invalid
+                    full_url = urljoin(url, href)
+                    parsed_href = urlparse(full_url)
 
-def extract_links(url: str, strategy: str = 'bfs', depth: int = 1, use_sitemap: bool = True, use_cc: bool = True) -> list[str]:
+                    # Scope check
+                    if scope == "domain" and start_domain not in parsed_href.netloc:
+                        continue
+                    if (
+                        scope == "subdomain" and parsed_href.netloc != start_domain
+                    ):  # Strict subdomain
+                        continue
+
+                    score = 0
+                    matches = []
+
+                    # Keyword matching
+                    for kw in keywords:
+                        kw_lower = kw.lower()
+                        if kw_lower in full_url.lower():
+                            score += 5
+                            matches.append(f"url:{kw}")
+                        if kw_lower in text.lower():
+                            score += 10
+                            matches.append(f"text:{kw}")
+
+                    if score > 0:
+                        discovered.append(
+                            {
+                                "url": full_url,
+                                "text": text,
+                                "score": score,
+                                "matches": matches,
+                            }
+                        )
+
+                except Exception:
+                    continue
+
+        except Exception as e:
+            print(f"Error in discover_links: {e}")
+        finally:
+            await browser.close()
+
+    return sorted(discovered, key=lambda x: x["score"], reverse=True)
+
+
+async def extract_links(
+    url: str,
+    topology: str = "mesh",
+    scope: str = "subdomain",
+    ignore_queries: bool = True,
+    max_pages: int = 50,
+) -> list[str]:
     """
-    Extracts links from a given URL using specified strategies.
-    Enforces strict domain scoping and robots.txt compliance.
+    Extracts links based on topology and scope.
+    Topology: 'mesh' (BFS), 'linear' (next/prev), 'hub_and_spoke' (depth 1), 'sidebar'.
     """
     start_domain = urlparse(url).netloc
     found_urls = set()
-    
-    # 1. Active Crawling (BFS/DFS)
-    if depth > 0:
-        with sync_playwright() as p:
-            browser, context = get_stealth_context(p)
-            
-            queue = deque([(url, 0)])
-            visited = set()
-            
-            while queue:
-                current_url, current_depth = queue.popleft() if strategy == 'bfs' else queue.pop()
-                
-                if current_url in visited or current_depth > depth:
-                    continue
-                
-                # Domain Check
-                if urlparse(current_url).netloc != start_domain:
-                    continue
+    queue = deque([(url, 0)])
+    visited = set()
 
-                # Robots.txt Check (Optimized: check once per domain usually, but here simple)
-                if not is_allowed_by_robots(current_url):
-                    continue
+    depth_limit = 1 if topology == "hub_and_spoke" else 3  # Default depth
 
-                visited.add(current_url)
-                found_urls.add(current_url)
-                
-                if current_depth < depth:
-                    try:
-                        page = context.new_page()
-                        stealth = Stealth()
-                        stealth.apply_stealth_sync(page)
-                        page.goto(current_url, wait_until="domcontentloaded", timeout=10000)
-                        
-                        links = page.eval_on_selector_all("a", "elements => elements.map(e => e.href)")
-                        page.close()
-                        
-                        for link in links:
-                            # Normalize and filter
-                            # Remove fragments
-                            link = link.split('#')[0]
-                            if link.startswith("http"):
-                                if urlparse(link).netloc == start_domain:
-                                    queue.append((link, current_depth + 1))
-                    except Exception as e:
-                        print(f"Error crawling {current_url}: {e}")
-            
-            browser.close()
+    async with async_playwright() as p:
+        browser, context = await util.get_stealth_context(p)
 
-    # 2. Sitemap
-    if use_sitemap:
-        sitemap_urls = get_sitemap_urls(url, start_domain)
-        found_urls.update(sitemap_urls)
+        while queue and len(found_urls) < max_pages:
+            current_url, current_depth = queue.popleft()
 
-    # 3. Common Crawl
-    if use_cc:
-        cc_urls = get_common_crawl_urls(url, start_domain)
-        found_urls.update(cc_urls)
+            # Normalize for visited check
+            visit_url = current_url
+            if ignore_queries:
+                visit_url = visit_url.split("?")[0]
+
+            if visit_url in visited or current_depth > depth_limit:
+                continue
+
+            # Scope Check
+            if scope == "subdomain" and urlparse(current_url).netloc != start_domain:
+                continue
+            if scope == "domain" and start_domain not in urlparse(current_url).netloc:
+                continue
+            # (Add 'path' scope logic if needed)
+
+            # Robots.txt Check
+            if not await util.is_allowed_by_robots(current_url):
+                continue
+
+            visited.add(visit_url)
+            found_urls.add(current_url)
+
+            if current_depth < depth_limit:
+                try:
+                    page = await context.new_page()
+                    await util.apply_stealth(page)
+                    await page.goto(
+                        current_url, wait_until="domcontentloaded", timeout=10000
+                    )
+
+                    links = []
+                    if topology == "linear":
+                        # Heuristic for next/prev
+                        links = await page.eval_on_selector_all(
+                            "a[rel='next'], a:text('Next'), a:text('Previous')",
+                            "elements => elements.map(e => e.href)",
+                        )
+                    elif topology == "sidebar":
+                        # Heuristic for sidebar
+                        links = await page.eval_on_selector_all(
+                            "aside a, .sidebar a, nav a",
+                            "elements => elements.map(e => e.href)",
+                        )
+                    else:
+                        links = await page.eval_on_selector_all(
+                            "a", "elements => elements.map(e => e.href)"
+                        )
+
+                    await page.close()
+
+                    for link in links:
+                        link = link.split("#")[0]
+                        if ignore_queries:
+                            link = link.split("?")[0]
+
+                        if link.startswith("http"):
+                            if (
+                                scope == "subdomain"
+                                and urlparse(link).netloc == start_domain
+                            ):
+                                queue.append((link, current_depth + 1))
+                            elif (
+                                scope == "domain"
+                                and start_domain in urlparse(link).netloc
+                            ):
+                                queue.append((link, current_depth + 1))
+
+                except Exception as e:
+                    print(f"Error crawling {current_url}: {e}")
+
+        await browser.close()
 
     return list(found_urls)
 
+
+async def extract_content(
+    url: str, click_selectors: list[str] = None, screenshot: bool = False
+) -> dict:
+    """
+    Extracts content from a URL.
+    - Handles click_selectors to reveal content.
+    - Returns Markdown, Screenshot (optional), and Metadata.
+    - Checks Content-Type for PDF/JSON (basic implementation).
+    """
+    result = {"markdown": None, "screenshot": None, "metadata": {}}
+
+    # Basic Content-Type check (HEAD request)
+    async with httpx.AsyncClient() as client:
+        try:
+            head = await client.head(url, follow_redirects=True, timeout=5)
+            content_type = head.headers.get("Content-Type", "").lower()
+
+            if "application/pdf" in content_type:
+                result["markdown"] = "[PDF Content - Extraction not implemented yet]"
+                result["metadata"]["type"] = "pdf"
+                return result
+            elif "application/json" in content_type:
+                resp = await client.get(url)
+                result["markdown"] = (
+                    f"```json\n{json.dumps(resp.json(), indent=2)}\n```"
+                )
+                result["metadata"]["type"] = "json"
+                return result
+        except Exception:
+            pass
+
+    async with async_playwright() as p:
+        browser, context = await util.get_stealth_context(p)
+        page = await context.new_page()
+        await util.apply_stealth(page)
+
+        try:
+            await page.goto(url, wait_until="networkidle", timeout=30000)
+
+            # Handle Clicks
+            if click_selectors:
+                for selector in click_selectors:
+                    try:
+                        await page.click(selector, timeout=2000)
+                        await page.wait_for_load_state("networkidle", timeout=2000)
+                    except Exception:
+                        pass  # Selector might not exist or be clickable
+
+            await util.auto_scroll(page)
+
+            if screenshot:
+                result["screenshot"] = (
+                    await page.screenshot(type="png")
+                ).hex()  # Returning hex for simplicity in text output
+
+            content = await page.content()
+            cleaned_html = util.clean_html(content)
+            result["markdown"] = util.convert_to_markdown(cleaned_html)
+            result["metadata"]["title"] = await page.title()
+            result["metadata"]["url"] = page.url
+
+        except Exception as e:
+            result["error"] = str(e)
+        finally:
+            await browser.close()
+
+    return result
+
+
 if __name__ == "__main__":
-    # Test
-    target = "https://docs.github.com/en/rest"
-    print(f"Extracting content from {target}...")
-    print(extract_content(target)[:100])
-    
-    print(f"\nExtracting links from {target}...")
-    links = extract_links(target, depth=1, use_sitemap=False, use_cc=False)
-    print(f"Found {len(links)} links: {links}")
+    import asyncio
+
+    # Test inspect_site
+    async def main():
+        print("Inspecting example.com...")
+        result = await inspect_site(
+            "https://developer.atlassian.com/cloud/jira/platform/rest/v3"
+        )
+        print(json.dumps(result, indent=2))
+
+    asyncio.run(main())
